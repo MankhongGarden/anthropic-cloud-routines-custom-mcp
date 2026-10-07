@@ -7,9 +7,10 @@
 - OAuth 2.1 + PKCE with stateless HS256 JWT — no auth-server DB. Three token types: 60s code · 1h access · 90d refresh. ~250 lines of TypeScript total across the OAuth files.
 - Routines run inside the Anthropic Max plan's daily routine quota — verified zero extra-usage charge at console.anthropic.com after a full week of 12 routines firing daily.
 - Three non-obvious findings the public guides don't mention:
-  1. **Custom connectors don't auto-flow into routines** — each routine needs explicit `mcp_connections`. The default Gmail connector that auto-attaches has no `send_email` (only `create_draft`), so without a custom MCP your routine can't actually deliver mail.
-  2. **`vercel env add` from CLI v53+ stores values as Sensitive type** — which AI routines cannot read. You have to use the REST API to store them as `encrypted` instead.
-  3. **The `connector_uuid` you need to attach a connector to a routine isn't exposed anywhere in the UI or API** — you read it from `claude.ai`'s IndexedDB react-query cache.
+  1. **Which connectors a routine gets depends on how you create it** — set `mcp_connections` explicitly on every routine. The Gmail connector has no tool that sends mail, so without a custom MCP your routine can't actually deliver a report.
+  2. ~~`vercel env add` stores values as Sensitive type, which AI routines cannot read.~~ **Corrected 2026-10:** the routine never reads your Vercel env — your MCP server does, at runtime. Sensitive only stops *you* reading the value back later. See Phase 4.
+  3. **The `connector_uuid` you need to attach a connector to a routine isn't shown in the connectors UI** — the easiest place to get it is the response of a routine create call (see Phase 5).
+- **Updated 2026-10:** the patterns held, but the failures that cost me most came *after* launch — routines deleted while docs still called them live, a pre-filled buffer hiding a dead producer, and a date-key bug where every run reported success while data went missing. See [What broke after launch](#what-broke-after-launch-updated-2026-10).
 
 ---
 
@@ -207,13 +208,11 @@ Even if every other check is wrong, an attacker can't redirect the authorization
 
 ---
 
-## Phase 4 — env vars (the Sensitive-type trap)
+## Phase 4 — env vars
 
-This is where the public guides get it wrong.
+> **Correction (2026-10).** The first version of this section said routines can't read Sensitive env vars, so you must store everything as `encrypted` via the REST API. That was the wrong diagnosis. The routine never touches your Vercel env — it calls your MCP server, and the server reads its env at runtime. What Sensitive type actually blocks is reading the value back afterwards (Vercel API or `vercel env pull`).
 
-If you run `vercel env add OAUTH_SIGNING_SECRET production` from CLI v53+, the value gets stored as type `Sensitive`. **AI routines cannot read Sensitive env vars** — they're only exposed at build time to specific build steps.
-
-You have to use the REST API to store them as type `encrypted` instead:
+The standard `vercel env add NAME production` is fine for secrets. Add a value with `--no-sensitive` only if something will need to read it back later. The REST API is an alternative if CLI auth is awkward on your machine:
 
 ```bash
 curl -X POST \
@@ -257,19 +256,9 @@ User-side only. OAuth requires consent, so this can't be automated.
 6. (Log in if not already) → click Approve
 7. 302 back to claude.ai → token exchange → connector connected
 
-To attach this connector to a routine, you need its `connector_uuid` — and **this is not exposed in any UI or public API**. You read it from claude.ai's IndexedDB:
+To attach this connector to a routine, you need its `connector_uuid`, which the connectors page doesn't show.
 
-```js
-// Run in the claude.ai DevTools console:
-// 1. Get org UUID
-fetch('/api/organizations', { credentials: 'include' })
-  .then(r => r.json())
-  .then(o => console.log('org', o?.[0]?.uuid));
-
-// 2. Then DevTools → Application → IndexedDB → keyval-store → keyval
-// Search the cached react-query data for your connector name.
-// connector_uuid is in the surrounding JSON.
-```
+**Updated 2026-10.** The original version of this section dug the UUID out of claude.ai's IndexedDB cache. By September that search returned nothing, so don't rely on it. The easier route: a routine created through the API *without* `mcp_connections` comes back with every connector on the account attached, UUIDs included (see gotcha 1). Copy the one you need from that response, then update the routine down to just that connector.
 
 ---
 
@@ -314,11 +303,11 @@ Once you have the UUID, create or update a routine with `mcp_connections`:
 
 In order of how much time each one cost me:
 
-1. **Custom connectors don't auto-flow into routines.** Each routine needs explicit `mcp_connections`. Probe a routine with an introspection prompt to see what's actually attached — only `mcp__Gmail__*` (12 tools) will show without explicit MCP attach.
+1. **Set `mcp_connections` explicitly on every routine.** In May, a routine set up without it saw only the Gmail tools. **Updated 2026-10:** a routine created through the API without `mcp_connections` gets *every* connector on the account attached, including ones it has no business touching. Either way, list exactly the connectors each routine needs. If you pass the list explicitly and the routine also needs Gmail, Gmail has to be in that list too.
 
-2. **Gmail connector has no `send_email` — only `create_draft`.** Routines that "send" via Gmail produce drafts you have to open and send manually. Always include your own `send_summary_email` tool.
+2. **The Gmail connector can't send mail.** **Updated 2026-10:** it is now Google's own Gmail MCP. Its tools include `search_threads`, `get_message`, `get_thread`, `create_draft`, `forward` and label management, but nothing that sends a new message to your inbox. Keep your own `send_summary_email`. For a routine that only reads mail, narrow Gmail's entry in `mcp_connections` with `"permitted_tools": ["search_threads", "get_message", "get_thread"]`.
 
-3. **`vercel env add` CLI stores Sensitive type.** Sensitive env vars are not exposed to routine runtime. Use the REST API with `type: "encrypted"`.
+3. ~~`vercel env add` CLI stores Sensitive type, not exposed to routine runtime.~~ **Corrected 2026-10:** this was wrong. Sensitive vars are still read by your server at runtime. Sensitive only blocks reading the value back, so use `--no-sensitive` for the ones you'll need to read later. See Phase 4.
 
 4. **`sources: []` for non-GitHub-connected projects.** Even one-shot manual `run` triggers a GitHub auth check. Empty sources skips it.
 
@@ -390,6 +379,11 @@ The Max 5x plan in effect during that test included 15 daily routine runs in the
 
 I'd avoid quoting a specific monthly cost projection — the quota and pricing details change. The practical takeaway: if you're already on Max plan and stay under the daily routine cap, the autonomous-cron pattern adds ฿0 to your monthly bill compared to running headless `claude -p` from local Task Scheduler. Verify your own plan's cap at `console.anthropic.com/settings/limits` before committing to a routine count.
 
+Two things I learned later:
+
+- **The daily cap is per account, not per project.** Routines from every project on the same account share it. The first sign you've hit it is an email saying your routines are paused for the day, while some routines quietly skip.
+- **Billing for automated usage has been in flux.** Anthropic announced a move of Agent SDK and `claude -p` usage into a separate credit pool, then paused it ([support article](https://support.claude.com/en/articles/15036540) still said paused as of 2026-10-07). Re-check that page and your limits before you quote a cost.
+
 ---
 
 ## What else I'd do differently
@@ -403,27 +397,51 @@ I'd avoid quoting a specific monthly cost projection — the quota and pricing d
 ## Anti-patterns to skip
 
 - **Putting write tools behind `description`-only caps.** The description is a hint to AI. AI does not enforce it. Cap-as-library is the only durable defense.
-- **Using `vercel env add` for routine-readable secrets.** Sensitive type is invisible to runtime. Use REST API + `type: "encrypted"`.
 - **Embedding `recipient` as a `send_email` parameter.** A leaked secret + a parameterized recipient is a spam cannon. Hardcode the recipient.
 - **Allowlist wildcards for `redirect_uri`.** Hardcoded set, no regex. The cost of explicitly listing four URIs is zero. The cost of a regex bug is unbounded.
-- **Skipping the IndexedDB step to grab `connector_uuid` and hoping the API will expose it later.** It might. It doesn't right now. Get the UUID once, save it in your project's env-or-config, move on.
+- **Not recording `connector_uuid` once you have it.** Save it in your project's env or config so you don't have to go looking for it again.
+- **Trusting a doc that says a routine is running.** List the live routines instead. See below.
 
 ---
 
 ## Lessons
 
 1. **OAuth 2.1 + PKCE with stateless HS256 JWT is plenty for solo-founder use.** No DB. ~250 lines. Revocation = rotate signing secret. Production-grade for what most personal projects need.
-2. **The hardest part isn't the OAuth — it's discovery.** Where's the `connector_uuid`? Why does my routine see Gmail tools but not mine? Why does `vercel env add` silently store unreadable values? The cron-replacement pattern works once you've answered each.
+2. **The hardest part isn't the OAuth — it's discovery.** Where's the `connector_uuid`? Why does my routine see Gmail tools but not mine? The cron-replacement pattern works once you've answered each. (After launch, the hardest part turned out to be noticing when a routine has quietly stopped doing its job. See the next section.)
 3. **Read-only blast-radius defense beats every other security choice you can make in this kind of project.** Skip write tools until you have a hard-cap discipline ready.
 4. **The cost story matters.** "Routines that run when laptop is off" is the headline. "And add nothing to my monthly bill if I'm already on Max plan and stay under the daily cap" is what makes the decision easy.
 5. **An identity-block at the top of the routine prompt — "you have access to mcp__YourName__* tools, here is what each does, here are the caps" — pays off as much as it does in CLAUDE.md.** Routines without that context guess what's available; routines with it call the right tool the first time.
 
 ---
 
+## What broke after launch (updated 2026-10)
+
+The setup above held up. These are the problems that showed up in the months afterwards. None of them raised an error.
+
+1. **Routines that are gone while your docs say they're live.** In August I listed a project's routines and got `[]`. Both had been deleted three weeks earlier to free up quota, but a handoff doc still described one as running, and nothing had produced content since. The live routine list is the source of truth, and memory or docs lag behind it. The opposite happens too: forgotten "ghost" routines keep firing and use up quota. When quota runs out unexpectedly, compare the live list with your notes. Treat deleting a producer routine as a system change, not a config tweak. With no scheduled producer, the work quietly becomes a human job, so put it wherever work gets planned, with the date the data runs out.
+
+2. **A pre-filled buffer hides a dead producer.** For a daily horoscope app, a routine fills about 30 days of content ahead. A check of "is tomorrow filled?" kept saying *yes* for weeks after the routine stopped. The failure only showed on the day users missed content. Part of the app had already served 20 days of empty sections, because the page using the data skips missing rows without any error. Monitor **runway**: how many consecutive days ahead are filled. Set the alert threshold to roughly how long a human needs to refill it, plus one cycle.
+
+3. **Don't re-generate the whole buffer by age.** "Re-queue any row older than 24h" looks harmless. For content that depends only on its inputs (a reading for a fixed future date), it regenerated the entire buffer every day: several times the work it needed. Runs blew past their time budget, and the wording changed from one day to the next for the same reading. Generate each row once instead. The "what's missing" tool returns only rows that don't exist yet, and the save tool leaves an existing row alone. Refresh only when you explicitly mark a row invalid (prompt change, input change).
+
+4. **Date-key bug: success everywhere, data missing.** The routine sandbox clock is UTC. A routine scheduled before 07:00 in UTC+7 runs while the sandbox still reads *yesterday*. A prompt saying "use today's date" wrote a morning digest under the previous day's key, a slot already consumed. That dropped a section from the digest two days running. Every run reported success, and the save tool returned `saved: true` every time. Fix: make the first tool call `TZ=<your zone> date +%F`, use that string as-is, and say "do not add or subtract a day". Don't explain the offset in the prompt instead: it's right at the scheduled hour, but on a manual run at any other hour the agent "corrects" a date that was already right. End each run's final message with the key it wrote under, so the runs list shows it at a glance. If a run shows success but today's data is missing, check the date before you touch auth.
+
+5. **Cron is UTC too.** 06:17 Monday in UTC+7 is 23:17 *Sunday* UTC (`17 23 * * 0`). Spread weekly routines across days instead of piling them onto Monday, which is the day that hits the cap first.
+
+6. **A manual run doesn't replace the scheduled one.** Triggering a run doesn't move `next_run_at`, so the same work takes two slots of the daily cap. To fill data *now*, do the same tool calls from an interactive session instead. Save manual runs for disabled routines, testing a prompt change, or recovering from a missed fire.
+
+7. **Don't test side-effecting routines by running the real one.** Create a throwaway one-shot routine a few minutes out, with the prompt forced into dry-run mode, then read its run log.
+
+8. **Prompt details for cloud runs.** Deferred MCP tools didn't come up when the routine searched its tools for `mcp__`. Name them explicitly in the routine prompt (`select:mcp__YourName__tool1,...`). Also add "never use PushNotification": a probe run sent a phone notification without being asked.
+
+9. **Disabling is the reversible delete.** The routine API had no delete action when I checked. `{"enabled": false}` stops a routine from firing or using quota and keeps its config. True deletion is UI-only. For routines that should stop on a date, a cron month filter (e.g. `0 9 * 5,6 *` fires in May and June only) does it without a calendar reminder.
+
+---
+
 ## Disclaimer
 
 - This pattern is verified on Next.js 16 + Vercel + Anthropic Max plan as of May 2026. Anthropic's CCR feature is actively evolving; specific endpoint paths and auth requirements may change.
-- Quoted env-var behavior (`vercel env add` storing as Sensitive type) is based on Vercel CLI v53. Verify on your CLI version before depending on it.
+- The env-var claim in the original May version (Sensitive vars unreadable by routines) was wrong and is corrected above. Check Sensitive vs. readable-back behavior on your own Vercel CLI version.
 - Read-only `supabase_admin_query` is **not a substitute for proper RLS**. If your service-role key leaks, the SELECT-only validator becomes the only thing standing between an attacker and your data. Treat it as defense-in-depth, not as primary control.
 
 ---
